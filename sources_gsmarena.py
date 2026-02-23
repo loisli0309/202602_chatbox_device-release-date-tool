@@ -1,89 +1,116 @@
-import time
-import random
+# sources/gsmarena.py
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import quote
+from typing import Optional, Dict, List
 
-BASE = "https://www.gsmarena.com"
+from config import HEADERS_WEB
+from utils_text import clean_text, extract_date_like, norm_key
 
-def browser_headers():
-    return {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
-    }
-
-def safe_get_once(url: str, timeout: int = 12):
-    """只请求一次，并打印真实错误"""
-    try:
-        time.sleep(random.uniform(0.8, 1.6))
-        r = requests.get(url, headers=browser_headers(), timeout=timeout)
-        print(f"[DEBUG] status={r.status_code} url={url}")
-
-        # Cloudflare challenge often returns 200 but contains JS challenge
-        if "cf-browser-verification" in r.text.lower():
-            raise RuntimeError("Blocked by Cloudflare challenge")
-
-        r.raise_for_status()
-        return r
-
-    except Exception as e:
-        raise RuntimeError(f"Request failed: {url} ; err={repr(e)}")
-
-def search_gsmarena(device: str, top_k: int = 5):
-    """搜索 GSMArena 设备详情页"""
-    q = device.replace(" ", "+")
-    search_url = f"{BASE}/res.php3?sSearch={q}"
+@st.cache_data(ttl=6 * 60 * 60)
+def gsmarena_search_candidates(model: str, debug: bool = False) -> Optional[Dict]:
+    q = quote(model.strip())
+    search_url = f"https://www.gsmarena.com/results.php3?sQuickSearch=yes&sName={q}"
 
     try:
-        r = safe_get_once(search_url)
-    except Exception as e:
-        return {
-            "name": "GSMArena",
-            "ok": False,
-            "error": str(e),
-            "attempt": 1,
-            "search_url": search_url,
-        }
+        r = requests.get(search_url, headers=HEADERS_WEB, timeout=15)
+    except requests.RequestException as e:
+        return {"source": "GSMArena", "error": f"search request failed: {e}", "search_url": search_url} if debug else None
+
+    if r.status_code != 200:
+        return {"source": "GSMArena", "error": f"search status_code={r.status_code}", "search_url": search_url} if debug else None
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    # 优先 makers 区域
-    links = soup.select("div.makers a[href]") or soup.select("a[href]")
+    makers = soup.select_one(".makers")
+    if not makers:
+        preview = clean_text(soup.get_text(" ", strip=True))[:200]
+        return {"source": "GSMArena", "error": "no .makers found (blocked or changed)",
+                "search_url": search_url, "preview": preview} if debug else None
 
     candidates = []
-    seen = set()
+    for a in makers.select("a[href]"):
+        href = a.get("href")
+        if href and href.endswith(".php"):
+            candidates.append({
+                "name": clean_text(a.get_text(" ", strip=True)),
+                "url": "https://www.gsmarena.com/" + href.lstrip("/")
+            })
 
-    for a in links:
-        href = a.get("href", "").strip()
-        if not href:
-            continue
+    if not candidates:
+        return {"source": "GSMArena", "error": "no candidates found", "search_url": search_url} if debug else None
 
-        # 过滤非详情页
-        if not href.endswith(".php"):
-            continue
+    return {"source": "GSMArena", "search_url": search_url, "candidates": candidates}
 
-        full = urljoin(BASE + "/", href)
-        if full in seen:
-            continue
-        seen.add(full)
+def pick_best_gsm_candidate(model: str, candidates: List[Dict]) -> Optional[str]:
+    if not candidates:
+        return None
 
-        text = a.get_text(" ", strip=True).lower()
-        candidates.append((text, full))
+    q = norm_key(model)
+    want_plus = "plus" in q
+    want_pro = "pro" in q
+    want_ultra = "ultra" in q
+    want_mini = "mini" in q
+    want_max = "max" in q
 
-    # 简单排序：包含 device 的优先
-    device_l = device.lower()
-    candidates.sort(key=lambda x: (device_l in x[0], x[0]), reverse=True)
+    bad_tokens = []
+    if not want_plus: bad_tokens.append("plus")
+    if not want_pro: bad_tokens.append("pro")
+    if not want_ultra: bad_tokens.append("ultra")
+    if not want_mini: bad_tokens.append("mini")
+    if not want_max: bad_tokens.append("max")
 
-    top = [c[1] for c in candidates[:top_k]]
+    for c in candidates:
+        name = norm_key(c["name"])
+        if q in name and not any(bt in name for bt in bad_tokens):
+            return c["url"]
+
+    for c in candidates:
+        name = norm_key(c["name"])
+        if q in name:
+            return c["url"]
+
+    return candidates[0]["url"]
+
+@st.cache_data(ttl=6 * 60 * 60)
+def fetch_gsmarena_from_detail_url(detail_url: str, debug: bool = False) -> Optional[Dict]:
+    detail_url = detail_url.strip()
+    if not detail_url:
+        return None
+
+    try:
+        r = requests.get(detail_url, headers=HEADERS_WEB, timeout=15)
+    except requests.RequestException as e:
+        return {"source": "GSMArena", "error": f"detail request failed: {e}", "page": detail_url} if debug else None
+
+    html = r.text or ""
+    soup = BeautifulSoup(html, "html.parser")
+
+    lower = html.lower()
+    blocked = any(x in lower for x in ["cloudflare", "just a moment", "checking your browser", "captcha"])
+    if blocked:
+        return {
+            "source": "GSMArena",
+            "page": detail_url,
+            "error": "Likely blocked (anti-bot / Cloudflare). requests did not receive real device HTML.",
+            "status_code": r.status_code,
+            "debug_title": soup.title.get_text(" ", strip=True) if soup.title else None,
+            "debug_preview": clean_text(soup.get_text(" ", strip=True))[:300],
+        } if debug else {"source": "GSMArena", "page": detail_url, "error": "blocked"}
+
+    def get_spec(spec_name: str) -> Optional[str]:
+        cell = soup.select_one(f'td[data-spec="{spec_name}"]')
+        return clean_text(cell.get_text(" ", strip=True)) if cell else None
+
+    status_text = get_spec("status")
+    announced_text = get_spec("announced")
 
     return {
-        "name": "GSMArena",
-        "ok": True,
-        "search_url": search_url,
-        "results": top,
+        "source": "GSMArena",
+        "page": detail_url,
+        "status": status_text,
+        "announced": announced_text,
+        "released_date": extract_date_like(status_text),
+        "announced_date": extract_date_like(announced_text),
+        "note": "Parsed from td[data-spec].",
     }
